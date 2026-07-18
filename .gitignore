@@ -1,0 +1,11 @@
+.mcp.json
+.env
+.env.*
+*.key
+*.pem
+credentials*.json
+*credential*
+!job-hunt-agent.workflow.json
+node_modules/
+docs/*.mp4
+CLAUDE.md
