@@ -9,3 +9,5 @@ credentials*.json
 node_modules/
 docs/*.mp4
 CLAUDE.md
+.claude/settings.local.json
+.claude
