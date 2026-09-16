@@ -1,0 +1,373 @@
+{
+  "name": "Job Hunt Agent — Feedback",
+  "nodes": [
+    {
+      "id": "fb000001-0000-4000-8000-000000000001",
+      "name": "Feedback Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "job-feedback",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "356b5b2f-5973-452d-bcc9-6ea55c6fd61c"
+    },
+    {
+      "id": "fb000002-0000-4000-8000-000000000002",
+      "name": "Parse Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The bridge (telegram-feedback-bridge.py) POSTs Telegram's callback_query object verbatim\n// as the request body. callback_data is capped at 64 bytes, so buttons carry the archive row\n// id, never the url: fb:<action>:<archive_id>.\nconst EXPECTED_CHAT = 'YOUR_TELEGRAM_CHAT_ID';\nconst cq = $input.first().json.body || {};\nconst data = String(cq.data || '');\nconst m = data.match(/^fb:(apply|save|skip|replied|rejected|noreply):(\\d+)$/);\nif (!m) throw new Error('Unrecognised callback_data: ' + data);\nconst msg = cq.message || {};\nconst chatId = String((msg.chat || {}).id ?? '');\nif (chatId !== EXPECTED_CHAT) throw new Error('callback_query from unexpected chat');\nconst STATUS = { apply: 'applied', save: 'saved', skip: 'skipped', replied: 'replied', rejected: 'rejected', noreply: 'no_reply' };\nconst LABEL  = { apply: 'Applied', save: 'Saved', skip: 'Skipped', replied: 'Got a reply', rejected: 'Rejected', noreply: 'No reply' };\nreturn [{ json: {\n  action: m[1], status: STATUS[m[1]], label: LABEL[m[1]],\n  archive_id: Number(m[2]),\n  callback_query_id: String(cq.id || ''),\n  chat_id: chatId,\n  message_id: String(msg.message_id || ''),\n  rated_at: new Date().toISOString(),\n} }];"
+      }
+    },
+    {
+      "id": "fb000003-0000-4000-8000-000000000003",
+      "name": "Lookup Job",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_ARCHIVE_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.archive_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "fb000004-0000-4000-8000-000000000004",
+      "name": "Build Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One status EVENT per press (append-only; the latest event per archive_id wins).\n// Key order here is the Google Sheet's header row: date, status, score, title, company,\n// source, url, archive_id, note.\nconst p = $('Parse Callback').first().json;\nconst job = $input.all().map(i => i.json).find(j => j && j.id !== undefined) || {};\nreturn [{ json: {\n  date: p.rated_at,\n  status: p.status,\n  score: job.score ?? '',\n  title: job.title || ('archive #' + p.archive_id),\n  company: job.company || '',\n  source: job.source || '',\n  url: job.url || '',\n  archive_id: p.archive_id,\n  note: '',\n} }];"
+      }
+    },
+    {
+      "id": "fb000005-0000-4000-8000-000000000005",
+      "name": "Record Feedback",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_FEEDBACK_TABLE_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "archive_id": "={{ $json.archive_id }}",
+            "url": "={{ $json.url }}",
+            "title": "={{ $json.title }}",
+            "rating": "={{ $json.status }}",
+            "rated_at": "={{ $json.date }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "fb000006-0000-4000-8000-000000000006",
+      "name": "Sheet Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Re-emit the event in sheet-header order; the data-table insert output has different keys.\nreturn $('Build Event').all();"
+      }
+    },
+    {
+      "id": "fb000007-0000-4000-8000-000000000007",
+      "name": "Append to Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1980,
+        0
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit?usp=sharing"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "url",
+          "value": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "name": "google sheets(job hunt)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "fb000008-0000-4000-8000-000000000008",
+      "name": "Render Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Re-render the job card from the archive row (the original message text is plain text with\n// its HTML entities stripped, so it cannot be edited in place) and append the status line.\nconst p = $('Parse Callback').first().json;\nconst j = $('Lookup Job').all().map(i => i.json).find(x => x && x.id !== undefined) || {};\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst lines = [];\nif (j.id !== undefined) {\n  lines.push('⭐ ' + esc(j.score) + ' · ' + esc(j.category || 'other'));\n  lines.push('<b><a href=\"' + esc(j.url) + '\">' + [j.title, j.company].filter(Boolean).map(esc).join(' — ') + '</a></b>');\n  if (j.one_liner) lines.push(esc(j.one_liner));\n  if (j.comp) lines.push('💰 ' + esc(j.comp));\n  if (j.red_flags) lines.push('⚠️ ' + esc(j.red_flags));\n  lines.push('🔗 ' + esc(j.url));\n  lines.push('(' + esc(j.source || 'unknown') + ')');\n} else {\n  lines.push('archive #' + p.archive_id + ' (not found in job_archive)');\n}\nconst ICON = { apply: '✅', save: '🔖', skip: '⏭️', replied: '💬', rejected: '❌', noreply: '🔕' };\nconst stamp = DateTime.fromISO(p.rated_at).setZone('Asia/Bangkok').toFormat('d LLL HH:mm');\nlines.push('', (ICON[p.action] || '•') + ' <b>' + esc(p.label) + '</b> · ' + stamp);\nreturn [{ json: { text: lines.join('\\n'), chat_id: p.chat_id, message_id: p.message_id, callback_query_id: p.callback_query_id, archive_id: p.archive_id, label: p.label } }];"
+      }
+    },
+    {
+      "id": "fb000009-0000-4000-8000-000000000009",
+      "name": "Answer Callback",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1320,
+        0
+      ],
+      "parameters": {
+        "resource": "callback",
+        "operation": "answerQuery",
+        "queryId": "={{ $json.callback_query_id }}",
+        "additionalFields": {
+          "text": "={{ 'Recorded: ' + $json.label }}"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram Job Bot"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "webhookId": "d66f5cb9-d4e6-4326-96a6-16111a84b49b"
+    },
+    {
+      "id": "fb000010-0000-4000-8000-000000000010",
+      "name": "Edit Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "editMessageText",
+        "messageType": "message",
+        "chatId": "={{ $('Render Message').first().json.chat_id }}",
+        "messageId": "={{ $('Render Message').first().json.message_id }}",
+        "text": "={{ $('Render Message').first().json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Apply",
+                    "additionalFields": {
+                      "callback_data": "=fb:apply:{{ $('Render Message').first().json.archive_id }}"
+                    }
+                  },
+                  {
+                    "text": "🔖 Save",
+                    "additionalFields": {
+                      "callback_data": "=fb:save:{{ $('Render Message').first().json.archive_id }}"
+                    }
+                  },
+                  {
+                    "text": "⏭️ Skip",
+                    "additionalFields": {
+                      "callback_data": "=fb:skip:{{ $('Render Message').first().json.archive_id }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram Job Bot"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "webhookId": "cdce7df3-6f05-474b-89ef-49c2fcc420dd"
+    }
+  ],
+  "connections": {
+    "Feedback Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Callback": {
+      "main": [
+        [
+          {
+            "node": "Lookup Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup Job": {
+      "main": [
+        [
+          {
+            "node": "Build Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Event": {
+      "main": [
+        [
+          {
+            "node": "Record Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheet Row": {
+      "main": [
+        [
+          {
+            "node": "Append to Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Message": {
+      "main": [
+        [
+          {
+            "node": "Answer Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Callback": {
+      "main": [
+        [
+          {
+            "node": "Edit Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Feedback": {
+      "main": [
+        [
+          {
+            "node": "Render Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Message": {
+      "main": [
+        [
+          {
+            "node": "Sheet Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Bangkok",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  }
+}

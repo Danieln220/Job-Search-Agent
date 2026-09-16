@@ -11,3 +11,7 @@ docs/*.mp4
 CLAUDE.md
 .claude/settings.local.json
 .claude
+# raw workflow backups contain the Telegram chat id - only the sanitized export is public
+backups/
+# instance workflow / data-table ids used by scripts/sanitize-exports.py
+sanitize.config.json

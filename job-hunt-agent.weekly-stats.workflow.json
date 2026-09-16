@@ -1,0 +1,174 @@
+{
+  "name": "Job Hunt Agent — Weekly Stats",
+  "nodes": [
+    {
+      "id": "w1000000-0000-4000-8000-000000000001",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 30 11 * * 0"
+            }
+          ]
+        }
+      },
+      "notes": "Sunday 11:30 in the workflow timezone (Asia/Bangkok since 2026-09-15) — after the 09:30 digest and the 11:00 spreadsheet export."
+    },
+    {
+      "id": "w1000000-0000-4000-8000-000000000002",
+      "name": "Read Archive",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_ARCHIVE_TABLE_ID"
+        },
+        "filters": {
+          "conditions": []
+        },
+        "returnAll": true
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "w1000000-0000-4000-8000-000000000003",
+      "name": "Build Stats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst tz = 'Asia/Bangkok';\nconst today = DateTime.now().setZone(tz).startOf('day');\nconst d0 = today.minus({ days: 6 }).toISODate();   // this week = last 7 days incl today\nconst dPrev = today.minus({ days: 13 }).toISODate();\nconst todayStr = today.toISODate();\n\n// Read Archive feeds Read Feedback feeds this node, so the archive rows come from the\n// named node and $input is the job_feedback table. 'nudged' rows are follow-up markers,\n// not statuses, and are excluded here.\nconst rows = $('Read Archive').all().map(i => i.json).filter(r => r && r.url);\nconst fb = $input.all().map(i => i.json).filter(r => r && r.archive_id !== undefined && r.archive_id !== null && r.rating !== 'nudged');\nconst day = (r) => String(r.first_seen || '').slice(0, 10);\nconst isSent = (r) => r.delivered === true || r.delivered === 1 || r.delivered === 'true';\nconst wk = rows.filter(r => day(r) >= d0 && day(r) <= todayStr);\nconst pv = rows.filter(r => day(r) >= dPrev && day(r) < d0);\n\nconst L = [];\nL.push('📊 <b>Weekly job-hunt stats</b> — ' + d0 + ' to ' + todayStr);\n\nif (wk.length === 0) {\n  L.push('');\n  L.push('No jobs scored this week. That usually means the agent did not run — worth checking n8n.');\n  return [{ json: { text: L.join('\\n') } }];\n}\n\nconst sent = wk.filter(isSent);\nconst sentPv = pv.filter(isSent);\nconst delta = (a, b) => { const d = a - b; return b === 0 ? '' : (d > 0 ? ' (+' + d + ')' : (d < 0 ? ' (' + d + ')' : ' (=)')); };\n\nL.push('');\nL.push('<b>Funnel</b>');\nL.push('• scored: ' + wk.length + delta(wk.length, pv.length));\nL.push('• delivered: ' + sent.length + delta(sent.length, sentPv.length) + ' (' + Math.round(100 * sent.length / wk.length) + '% of scored)');\nL.push('• days with a digest: ' + new Set(sent.map(day)).size + ' of 7');\n\n// pipeline — what the user DID with what was delivered (job_feedback button presses).\n// \"this week\" counts events; \"all time\" uses the LATEST status per job (append-only log,\n// latest wins). applied/no_reply = still waiting; replied/rejected = closed.\nif (fb.length) {\n  const byJob = {};\n  for (const e of fb) { const k = String(e.archive_id); if (!byJob[k] || String(e.rated_at) > String(byJob[k].rated_at)) byJob[k] = e; }\n  const latest = Object.values(byJob);\n  const wkEv = fb.filter(e => String(e.rated_at).slice(0, 10) >= d0);\n  const cnt = (arr, st) => arr.filter(e => e.rating === st).length;\n  const appliedAll = latest.filter(e => ['applied', 'no_reply', 'replied', 'rejected'].includes(e.rating));\n  const replied = cnt(latest, 'replied'), rejected = cnt(latest, 'rejected');\n  const waiting = latest.filter(e => e.rating === 'applied' || e.rating === 'no_reply');\n  L.push('');\n  L.push('<b>Pipeline</b> (from your buttons)');\n  L.push('• this week: applied ' + cnt(wkEv, 'applied') + ' · saved ' + cnt(wkEv, 'saved') + ' · skipped ' + cnt(wkEv, 'skipped') + ' · replies ' + cnt(wkEv, 'replied') + ' · rejected ' + cnt(wkEv, 'rejected'));\n  L.push('• all time: applied ' + appliedAll.length + ' → replies ' + replied + (appliedAll.length ? ' (' + Math.round(100 * replied / appliedAll.length) + '%)' : '') + ' · rejected ' + rejected + ' · saved ' + cnt(latest, 'saved'));\n  if (waiting.length) {\n    const oldest = Math.max(...waiting.map(e => Math.floor(today.diff(DateTime.fromISO(String(e.rated_at)).setZone(tz).startOf('day'), 'days').days)));\n    L.push('• waiting on a reply: ' + waiting.length + ' (oldest ' + oldest + 'd)');\n  }\n}\n\n// score spread — this is what tells you whether a model/prompt change moved calibration\nconst buckets = [[90, 100, '90+'], [80, 90, '80s'], [70, 80, '70s'], [60, 70, '60s'], [40, 60, '40-59'], [0, 40, 'under 40']];\nL.push('');\nL.push('<b>Score spread</b>');\nfor (const [lo, hi, lbl] of buckets) {\n  const n = wk.filter(r => Number(r.score) >= lo && Number(r.score) < hi).length;\n  if (n) L.push('• ' + lbl.padEnd(9) + ' ' + n);\n}\n\n// which sources earn their token spend\nconst agg = {};\nfor (const r of wk) {\n  const a = agg[r.source] || (agg[r.source] = { n: 0, hit: 0, sent: 0 });\n  a.n++;\n  if (Number(r.score) >= 60) a.hit++;\n  if (isSent(r)) a.sent++;\n}\nL.push('');\nL.push('<b>Sources</b> (scored → hit-rate → sent)');\nfor (const [s, a] of Object.entries(agg).sort((x, y) => y[1].hit - x[1].hit)) {\n  L.push('• ' + esc(s) + ': ' + a.n + ' → ' + Math.round(100 * a.hit / a.n) + '% → ' + a.sent);\n}\n\nconst top = sent.slice().sort((a, b) => Number(b.score) - Number(a.score)).slice(0, 5);\nif (top.length) {\n  L.push('');\n  L.push('<b>Best delivered this week</b>');\n  for (const r of top) L.push('• ' + Number(r.score) + ' · <a href=\"' + esc(r.url) + '\">' + esc(String(r.title).slice(0, 60)) + '</a>');\n}\n\n// near-misses: what the gate is rejecting. If these look good, the gate is too high.\nconst near = wk.filter(r => !isSent(r) && Number(r.score) >= 40).sort((a, b) => Number(b.score) - Number(a.score)).slice(0, 5);\nif (near.length) {\n  L.push('');\n  L.push('<b>Near misses</b> (scored 40+, not sent)');\n  for (const r of near) L.push('• ' + Number(r.score) + ' · ' + esc(String(r.title).slice(0, 55)) + ' — ' + esc(r.seniority_fit || ''));\n}\n\nlet text = L.join('\\n');\nif (text.length > 3800) text = text.slice(0, 3780) + '\\n…(truncated)';\nreturn [{ json: { text } }];"
+      }
+    },
+    {
+      "id": "w1000000-0000-4000-8000-000000000004",
+      "name": "Telegram: Weekly",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram Job Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "ac95f1c2-3ee9-41df-8317-35df2d58a0e1"
+    },
+    {
+      "id": "ws000005-0000-4000-8000-000000000005",
+      "name": "Read Feedback",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_FEEDBACK_TABLE_ID"
+        },
+        "filters": {
+          "conditions": []
+        },
+        "returnAll": true
+      },
+      "notes": "All job_feedback events (button presses + 'nudged' markers). executeOnce is REQUIRED: this node's input is the 1000+ archive rows from Read Archive, and a data-table node runs once per input item, so without it the feedback rows are fetched once per archive row (first test: 'saved 1057').",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "executeOnce": true
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Archive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Stats": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Weekly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Archive": {
+      "main": [
+        [
+          {
+            "node": "Read Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Feedback": {
+      "main": [
+        [
+          {
+            "node": "Build Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Bangkok",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}

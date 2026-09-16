@@ -1,0 +1,210 @@
+{
+  "name": "Job Hunt Agent — Follow-ups",
+  "nodes": [
+    {
+      "id": "fu000001-0000-4000-8000-000000000001",
+      "name": "Daily 18:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 18,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "notes": "18:00 in the workflow timezone (Asia/Bangkok). Evening, so the user answers about today's replies, not yesterday's."
+    },
+    {
+      "id": "fu000003-0000-4000-8000-000000000003",
+      "name": "Read Feedback",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_FEEDBACK_TABLE_ID"
+        },
+        "filters": {
+          "conditions": []
+        },
+        "returnAll": true
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "fu000004-0000-4000-8000-000000000004",
+      "name": "Build Nudges",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Nudges for jobs that went quiet. Reads EVERY job_feedback event and works per job:\n//  status    = latest event that is not a 'nudged' marker (what the user last said)\n//  lastTouch = latest event of any kind, nudges included (each nudge restarts the clock)\n// applied / no_reply, quiet 7+ days -> \"any reply yet?\"     (replied / rejected / noreply)\n// saved,              quiet 7+ days -> \"still interested?\"  (apply / skip / save = remind later)\n// Every button goes through the Feedback workflow, so an answer is just another event.\nconst DAYS = 7, MAX_PER_DAY = 10;\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst now = DateTime.now();\nconst rows = $input.all().map(i => i.json).filter(r => r && r.archive_id !== undefined && r.archive_id !== null);\nconst byJob = {};\nfor (const r of rows) { const k = String(r.archive_id); if (!byJob[k]) byJob[k] = []; byJob[k].push(r); }\nconst out = [];\nfor (const id of Object.keys(byJob)) {\n  const evs = byJob[id].slice().sort((a, b) => String(a.rated_at).localeCompare(String(b.rated_at)));\n  const last = evs[evs.length - 1];\n  const status = evs.slice().reverse().find(e => e.rating !== 'nudged') || last;\n  const quietDays = now.diff(DateTime.fromISO(String(last.rated_at)), 'days').days;\n  if (!(quietDays >= DAYS)) continue;\n  const url = String(status.url || '');\n  const title = esc(status.title || ('job #' + id));\n  const link = url ? '<a href=\"' + esc(url) + '\">' + title + '</a>' : title;\n  const since = DateTime.fromISO(String(status.rated_at)).setZone('Asia/Bangkok').toFormat('d LLL');\n  const base = { archive_id: Number(id), url, title: status.title || '', rating: 'nudged', rated_at: now.toISO(), quietDays: Math.floor(quietDays) };\n  if (status.rating === 'applied' || status.rating === 'no_reply') {\n    out.push({ json: { ...base, text: '📬 You applied to <b>' + link + '</b> on ' + since + ' — any reply yet?', b1: '💬 Got a reply', c1: 'fb:replied:' + id, b2: '❌ Rejected', c2: 'fb:rejected:' + id, b3: '🔕 Nothing yet', c3: 'fb:noreply:' + id } });\n  } else if (status.rating === 'saved') {\n    out.push({ json: { ...base, text: '🔖 You saved <b>' + link + '</b> on ' + since + ' — still interested?', b1: '✅ Apply', c1: 'fb:apply:' + id, b2: '⏭️ Skip', c2: 'fb:skip:' + id, b3: '🔖 Remind me later', c3: 'fb:save:' + id } });\n  }\n}\nout.sort((a, b) => b.json.quietDays - a.json.quietDays);\nconst picked = out.slice(0, MAX_PER_DAY);\nconsole.log('Follow-ups: ' + rows.length + ' events, ' + Object.keys(byJob).length + ' jobs, ' + out.length + ' due, sending ' + picked.length);\nreturn picked;"
+      }
+    },
+    {
+      "id": "fu000005-0000-4000-8000-000000000005",
+      "name": "Record Nudge",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_JOB_FEEDBACK_TABLE_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "archive_id": "={{ $json.archive_id }}",
+            "url": "={{ $json.url }}",
+            "title": "={{ $json.title }}",
+            "rating": "={{ $json.rating }}",
+            "rated_at": "={{ $json.rated_at }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "notes": "Writes a 'nudged' event per job BEFORE the send, so the 7-day clock restarts even if Telegram fails after retries. 'nudged' rows are markers, not statuses: Build Nudges skips them when reading status, and the weekly funnel ignores them."
+    },
+    {
+      "id": "fu000006-0000-4000-8000-000000000006",
+      "name": "Telegram: Nudge",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Build Nudges').item.json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "={{ $('Build Nudges').item.json.b1 }}",
+                    "additionalFields": {
+                      "callback_data": "={{ $('Build Nudges').item.json.c1 }}"
+                    }
+                  },
+                  {
+                    "text": "={{ $('Build Nudges').item.json.b2 }}",
+                    "additionalFields": {
+                      "callback_data": "={{ $('Build Nudges').item.json.c2 }}"
+                    }
+                  },
+                  {
+                    "text": "={{ $('Build Nudges').item.json.b3 }}",
+                    "additionalFields": {
+                      "callback_data": "={{ $('Build Nudges').item.json.c3 }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram Job Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "932b13d1-5bda-496e-9bc8-cdb6369221a9"
+    }
+  ],
+  "connections": {
+    "Daily 18:00": {
+      "main": [
+        [
+          {
+            "node": "Read Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Feedback": {
+      "main": [
+        [
+          {
+            "node": "Build Nudges",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Nudges": {
+      "main": [
+        [
+          {
+            "node": "Record Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Nudge": {
+      "main": [
+        [
+          {
+            "node": "Telegram: Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Bangkok",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  }
+}

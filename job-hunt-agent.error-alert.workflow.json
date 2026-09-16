@@ -18,14 +18,14 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        220,
+        440,
         0
       ],
       "parameters": {
         "resource": "message",
         "operation": "sendMessage",
         "chatId": "YOUR_TELEGRAM_CHAT_ID",
-        "text": "=⚠️ <b>Job Hunt Agent failed</b>\nWorkflow: {{ ($json.workflow?.name || 'unknown').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nNode: {{ ($json.execution?.lastNodeExecuted || 'unknown').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nError: {{ String($json.execution?.error?.message || 'unknown').slice(0,300).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nExecution id: {{ $json.execution?.id || '?' }}",
+        "text": "=⚠️ <b>Job Hunt Agent failed</b>\nWorkflow: {{ ($json.workflow?.name || 'unknown').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nNode: {{ ($json.execution?.lastNodeExecuted || 'unknown').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nError: {{ String($json.execution?.error?.message || 'unknown').slice(0,300).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nExecution id: {{ $json.execution?.id || '?' }}{{ $json.suppressedSinceLast > 0 ? '\\n\\n(+' + $json.suppressedSinceLast + ' more failures suppressed in the last hour)' : '' }}",
         "additionalFields": {
           "appendAttribution": false,
           "parse_mode": "HTML"
@@ -36,14 +36,40 @@
           "name": "Telegram Job Bot"
         }
       },
-      "webhookId": "",
+      "webhookId": "cf3f3ebd-ea7d-4e14-86bd-8dbfe0832427",
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000
+    },
+    {
+      "id": "27105e75-ad86-4824-9daf-ed5690f72906",
+      "name": "Alert Throttle",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rate-limit alerts to at most one per hour.\n// Since 2026-07-28 the catch-up fires 4x/hour, so a persistent failure (dead network at\n// 09:30, or a wedged Code-node task runner) would otherwise fire ~60 Telegram messages a\n// day. Send the first one, swallow the rest, and report the count on the next real send so\n// nothing is silently lost.\nconst WINDOW_MS = 60 * 60 * 1000;\nconst sd = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst last = Number(sd.lastAlertAt) || 0;\n\nif (now - last < WINDOW_MS) {\n  sd.suppressedCount = (Number(sd.suppressedCount) || 0) + 1;\n  console.log('Alert suppressed (' + sd.suppressedCount + ' since last send)');\n  return [];\n}\n\nconst swallowed = Number(sd.suppressedCount) || 0;\nsd.lastAlertAt = now;\nsd.suppressedCount = 0;\nconst items = $input.all();\nfor (const it of items) { it.json.suppressedSinceLast = swallowed; }\nconsole.log('Alert sending (' + swallowed + ' suppressed since last send)');\nreturn items;"
+      },
+      "notes": "One alert per hour max. Trade-off accepted 2026-07-28: this puts a Code node on the alert path, so if the task runner itself is down, alerts stop too. The 21:30 watchdog is the backstop."
     }
   ],
   "connections": {
     "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alert Throttle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Throttle": {
       "main": [
         [
           {
@@ -57,8 +83,9 @@
   },
   "settings": {
     "executionOrder": "v1",
-    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
     "saveDataSuccessExecution": "all",
-    "saveDataErrorExecution": "all"
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
   }
 }

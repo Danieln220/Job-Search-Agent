@@ -1,6 +1,6 @@
 # Job Hunt Agent (n8n)
 
-An autonomous daily job-scouting pipeline built in n8n. Every morning at 09:30 (Asia/Jerusalem) it collects fresh remote job postings from eight sources, scores them against a specific candidate profile with an LLM, and delivers a ranked digest to Telegram.
+An autonomous job-scouting **pipeline** built in n8n. Every morning it collects fresh remote job postings from eight sources, scores them against a specific candidate profile with an LLM, and delivers each qualifying job to Telegram as its own card with **Apply / Save / Skip** buttons. Presses flow back into the system — a status table, a Google Sheet, and (next) the scoring prompt itself — so the bot tracks the search instead of just feeding it.
 
 ![Workflow canvas](docs/canvas.png)
 *(canvas screenshot placeholder)*
@@ -14,38 +14,71 @@ An autonomous daily job-scouting pipeline built in n8n. Every morning at 09:30 (
 | RemoteOK | Public API |
 | Remotive | API, `ai` + `automation` searches, URL-deduplicated |
 | We Work Remotely | Programming-jobs RSS feed |
-| HN "Who is Hiring" | Algolia API → newest monthly thread → REMOTE comments |
+| HN "Who is Hiring" | Algolia API → newest monthly thread → REMOTE comments, HTML entities decoded, prose-style posts get a capped title |
 | n8n community job board | Discourse API, 15 newest topics |
 | Working Nomads | Public API |
 | Jobicy | Public API, geo/type/level folded into the description |
 | Arbeitnow | Public API, remote-flagged postings only |
 
-Every source is normalized to a single data contract (`title, company, description, url, source, posted_at`), merged, and deduplicated **across runs** by URL (10,000-entry history) — a posting is delivered at most once, ever.
+Every source is normalized to a single data contract (`title, company, description, url, source, posted_at`), merged, and deduplicated **across runs** by URL (50,000-entry history) — a posting is delivered at most once, ever.
 
 ## Scoring
 
-A cheap word-boundary keyword filter (include/exclude lists) trims the daily haul to the plausible subset — and drops job-*seeker* self-promotion posts that community boards mix in with real offers. Survivors are scored in batches of 5 by Groq (`llama-3.3-70b-versatile`, temperature 0), which returns strict JSON per job: category, region lock, seniority fit, a 0–100 score, stated compensation, a one-line verdict, and red flags. A truncated LLM response is salvaged up to the last complete object, so a bad batch loses at most a few jobs. Jobs scoring ≥ 50 that aren't senior-only reach the digest; the top 15 by score are sent.
+A word-boundary keyword filter runs before any LLM call. A posting must contain a **strong** term anywhere (`llm`, `rag`, `langchain`, `n8n`, `chatbot`, `mcp`, `ai agent`, `openai`, …) or a **weak** one in the *title* (`ai`, `automation`, `python`, `agent`, …) — weak terms in a 1,500-character body ("we use AI") were the biggest source of wasted scoring calls. Titles that announce seniority (`senior`, `staff`, `principal`, `lead`, …) are dropped here: across 250 archived jobs the LLM had agreed with that title read 100% of the time, so it was pure cost. So are job-*seeker* posts that community boards mix in with real offers — both by phrase ("available for hire") and by the forum convention of a `[For Hire]` title prefix, which alone accounted for 11% of all scoring spend before it was filtered.
 
-**Hard scoring rules in the prompt:** posts by people advertising *themselves* for hire score under 10; roles requiring a working language other than the candidate's score under 40 with a red flag naming the language. Region restrictions are classified and surfaced as red flags (e.g. "US-only hiring") but deliberately don't gate delivery — that judgment stays with the human.
+Survivors are scored in batches of 5 by Groq (`openai/gpt-oss-120b`, temperature 0), which returns strict JSON per job: category, region lock, seniority fit, a 0–100 score, stated compensation, a one-line verdict, and red flags. The gate is **score ≥ 60, open to applicants worldwide** (US-only, EU-only and "must be based in X" roles are dropped; time-zone-overlap requirements are fine), not senior-only, not category `other`, and no on-site/hybrid flag. The top 15 by score are sent.
+
+Every scored job — not just the delivered ones — is written to an n8n data table with its full LLM verdict, so the funnel can be measured after the fact instead of guessed at. That archive is how each threshold was set: the original ≥ 40 came from a histogram showing the first model never emitted 41–59; the move to ≥ 60 came from re-measuring after the model swap, when 36 of 136 delivered jobs sat in the 40–59 band and none had been worth applying to.
+
+**Hard scoring rules in the prompt:** posts by people advertising *themselves* for hire score under 10; roles requiring a working language other than the candidate's score under 40 with a red flag naming the language; roles restricted to a country or region score under 40 with a red flag naming the restriction.
+
+## The digest and the feedback loop
+
+The digest is a header message (date, count, per-section tally) followed by **one message per job** in three sections — 🎯 Apply now (80+), 👀 Worth a look, 💼 Gigs & side income — each with a linked title, the verdict, posting age in calendar days, compensation, red flags, and an inline keyboard: ✅ Apply · 🔖 Save · ⏭️ Skip. Jobs scoring 80+ additionally get a drafted pitch and the CV sent to the user's *own* chat, ready to forward — the bot never contacts an employer.
+
+Button presses are the interesting part. n8n runs on a laptop with no public URL, so Telegram cannot call it; instead a 150-line Python bridge (`scripts/telegram-feedback-bridge.py`) long-polls Telegram's `getUpdates` and forwards each press to a local n8n webhook. Delivery is at-least-once by construction: the bridge advances Telegram's offset only after n8n has acknowledged the press, so an n8n outage delays a press rather than losing it, and a single-instance lock lets a scheduled task relaunch the bridge every ten minutes as a self-heal. The Feedback workflow then records an append-only status event in a `job_feedback` table **and** appends the same row to a Google Sheet, answers the callback so the button stops spinning, and redraws the card with a status line — keeping the buttons, so a mis-press is corrected by pressing again (latest event wins). The user sees the redraw in about a second; the slow Google Sheets write is deliberately sequenced after it.
+
+A follow-ups workflow runs every evening: any job marked *applied* and untouched for seven days gets a "any reply yet?" nudge (💬 Got a reply · ❌ Rejected · 🔕 Nothing yet); a *saved* job gets "still interested?" (✅ Apply · ⏭️ Skip · 🔖 Remind me later). Each nudge is itself recorded, so the clock restarts and nothing nags daily. A weekly stats workflow (Sunday) reports the scoring funnel, week-over-week deltas, per-source hit rates, the best delivered jobs, near misses (scored 40+ but not sent) so the gate stays falsifiable — and now the pipeline the buttons produce: applied, saved, replies, rejections, and how many applications are still waiting on an answer.
 
 ## Resilience
 
 - Every fetch node continues on error — one dead source never kills the run.
-- If *every* source returns nothing (in practice: the machine woke without network), the run fails fast instead of delivering a false "nothing new" — the hourly catch-up retries once connectivity is back.
-- A malformed LLM response drops only its own batch of 5 (usually less, via truncation salvage), logged, never thrown.
+- If *every* source returns nothing (in practice: the machine woke without network), the run fails fast instead of delivering a false "nothing new" — the catch-up retries once connectivity is back.
+- LLM requests are spaced to stay under the provider's tokens-per-minute limit. This was measured, not assumed: batches were silently vanishing, and the stored execution data showed every response that *arrived* parsed perfectly while the missing ones were HTTP 429s. Retry settings can't fix that — n8n caps retry backoff below the length of a rate-limit window — so the fix is throughput, not retries.
+- A malformed LLM response drops only its own batch of 5, logged, never thrown; an LLM that echoes a mangled URL (the only join key) is repaired or dropped, never archived as a blank row.
 - Telegram sends retry 3× — a delivery blip doesn't cost the day's digest.
 - Zero-job days still deliver a "nothing new" message: a silent day means something is broken, a message means the pipeline is healthy.
-- A dedicated error workflow pushes a Telegram alert (failing node + error) whenever a run crashes.
-- Missed-run catch-up: an hourly guarded trigger re-attempts the digest if the 08:30 run didn't happen (machine was off), at most once per day.
-- Long digests split across multiple Telegram messages at job boundaries instead of truncating.
+- The archive write is chained *ahead* of the digest rather than run as a parallel branch, so a crash in the delivery path can't lose the day's scored data — and the "delivered" flag updates rows that are guaranteed to exist.
+- A dedicated error workflow pushes a Telegram alert (failing node + error) whenever a run crashes, throttled to one per hour so a persistent fault can't flood the chat.
+- Missed-run catch-up: a guarded trigger every 15 minutes re-attempts the digest if the morning run didn't happen (machine was off), at most once per day, and only inside a clock window enforced in code — because the cron library replays missed ticks on wake, which once delivered a digest at 00:38.
+- Only one production execution runs at a time, and executions are hard-capped at 20 minutes; overlapping or sleeping runs previously saturated n8n's code-execution runner and wedged the instance.
+- A 21:30 watchdog reports if no digest went out that day. It exists because the error workflow needs the *same* network whose absence usually caused the failure — so it can't be the only alarm.
+- All schedules and date logic use one explicit workflow time zone, so the laptop's own zone (which changes when its owner travels) cannot shift the digest.
 
 ## Prompt-injection awareness
 
 Job postings are untrusted external text passed to an LLM. The scoring prompt explicitly instructs the model to treat posting content as data to evaluate and to ignore any instructions embedded inside it.
 
+## Files
+
+| File | What |
+|---|---|
+| `job-hunt-agent.workflow.json` | Main pipeline (53 nodes) |
+| `job-hunt-agent.feedback.workflow.json` | Button-press handler (webhook → table + sheet → redraw card) |
+| `job-hunt-agent.error-alert.workflow.json` | Error-trigger workflow with hourly throttle |
+| `job-hunt-agent.follow-ups.workflow.json` | Daily 18:00 nudges for applications that went quiet |
+| `job-hunt-agent.weekly-stats.workflow.json` | Sunday funnel / hit-rate report, now including the button-derived pipeline |
+| `scripts/telegram-feedback-bridge.py` | Telegram → local n8n long-polling bridge |
+| `scripts/sanitize-exports.py` | Regenerates the exports above from a live instance, whitelist-sanitized and secret-scanned |
+
+The exports contain no secrets: credentials are referenced by name only, and the chat id, sheet id and data-table ids are placeholders.
+
 ## Setup
 
-1. Import `job-hunt-agent.workflow.json` into n8n.
-2. Create two credentials, named exactly: **`Telegram Job Bot`** (Telegram API, bot token from @BotFather) and **`Groq API`** (Header Auth: name `Authorization`, value `Bearer <key>`).
-3. Replace `YOUR_TELEGRAM_CHAT_ID` in the Telegram node with your numeric chat id.
-4. Activate. The workflow file contains no secrets — credentials are referenced by name only.
+1. Import the five workflow files into n8n.
+2. Create the credentials, named exactly: **`Telegram Job Bot`** (Telegram API, bot token from @BotFather), **`Groq API`** (Header Auth: name `Authorization`, value `Bearer <key>`), and **`google sheets(job hunt)`** (Google Service Account; share your sheet with the service-account email).
+3. Create two data tables and put their ids in place of `YOUR_JOB_ARCHIVE_TABLE_ID` / `YOUR_JOB_FEEDBACK_TABLE_ID`: `job_archive` (url, title, company, source, score, category, region_lock, seniority_fit, comp, one_liner, red_flags, posted_at, first_seen, delivered) and `job_feedback` (archive_id, url, title, rating, rated_at).
+4. Replace `YOUR_TELEGRAM_CHAT_ID` (Telegram nodes and the Feedback workflow's `Parse Callback` code) and `YOUR_GOOGLE_SHEET_ID`; give the sheet a header row `date, status, score, title, company, source, url, archive_id, note`.
+5. Optional apply-assist: set `CV_READY = true` in `Apply Prep` and point `Read CV` at a PDF inside n8n's allowed file directory.
+6. In the main workflow's settings, select the error workflow; set the workflow time zone to yours.
+7. For the buttons: put the bot token in a file the bridge can read, run `scripts/telegram-feedback-bridge.py` under a scheduled task, and activate the Feedback workflow.
