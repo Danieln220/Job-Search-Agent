@@ -15,3 +15,6 @@ CLAUDE.md
 backups/
 # instance workflow / data-table ids used by scripts/sanitize-exports.py
 sanitize.config.json
+.superpowers/
+# generated search workflow (contains the chat id) - rebuild with search/build_workflow.py
+search/dist/

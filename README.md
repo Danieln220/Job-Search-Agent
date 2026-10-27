@@ -1,6 +1,6 @@
 # Job Hunt Agent (n8n)
 
-An autonomous job-scouting **pipeline** built in n8n. Every morning it collects fresh remote job postings from eight sources, scores them against a specific candidate profile with an LLM, and delivers each qualifying job to Telegram as its own card with **Apply / Save / Skip** buttons. Presses flow back into the system — a status table, a Google Sheet, and (next) the scoring prompt itself — so the bot tracks the search instead of just feeding it.
+An autonomous job-scouting **pipeline** built in n8n. Every morning it collects fresh remote job postings from eleven sources, scores them against a specific candidate profile with an LLM, and delivers each qualifying job to Telegram as its own card with **Apply / Save / Skip** buttons. Presses flow back into the system — a status table, a Google Sheet, and (next) the scoring prompt itself — so the bot tracks the search instead of just feeding it. The same chat also takes on-demand searches: type what you're looking for and get a numbered list back.
 
 ![Workflow canvas](docs/canvas.png)
 *(canvas screenshot placeholder)*
@@ -13,14 +13,18 @@ An autonomous job-scouting **pipeline** built in n8n. Every morning it collects 
 |---|---|
 | RemoteOK | Public API |
 | Remotive | API, `ai` + `automation` searches, URL-deduplicated |
-| We Work Remotely | Programming-jobs RSS feed |
+| We Work Remotely | Programming, full-stack and all-jobs RSS feeds, URL-deduplicated |
 | HN "Who is Hiring" | Algolia API → newest monthly thread → REMOTE comments, HTML entities decoded, prose-style posts get a capped title |
 | n8n community job board | Discourse API, 15 newest topics |
 | Working Nomads | Public API |
-| Jobicy | Public API, geo/type/level folded into the description |
+| Jobicy | Public API (general + `geo=anywhere`), geo/type/level folded into the description |
 | Arbeitnow | Public API, remote-flagged postings only |
+| Freelancer.com | Public projects API, one query per search term, budget + skills folded into the description |
+| Reddit | Subreddit RSS (no API key), hiring intent decided from the title before any LLM call |
+| LinkedIn | Job-alert emails read from Gmail (read-only OAuth), parsed into postings |
+| Himalayas | Search API, worldwide + Israel-inclusive roles (on-demand search only) |
 
-Every source is normalized to a single data contract (`title, company, description, url, source, posted_at`), merged, and deduplicated **across runs** by URL (50,000-entry history) — a posting is delivered at most once, ever.
+Every source is normalized to a single data contract (`title, company, description, url, source, posted_at`), merged, and deduplicated **across runs** against the job archive by URL — a posting is scored at most once, and a run that crashes before scoring loses nothing, because nothing is marked seen until it has been scored.
 
 ## Scoring
 
@@ -39,6 +43,12 @@ The digest is a header message (date, count, per-section tally) followed by **on
 Button presses are the interesting part. n8n runs on a laptop with no public URL, so Telegram cannot call it; instead a 150-line Python bridge (`scripts/telegram-feedback-bridge.py`) long-polls Telegram's `getUpdates` and forwards each press to a local n8n webhook. Delivery is at-least-once by construction: the bridge advances Telegram's offset only after n8n has acknowledged the press, so an n8n outage delays a press rather than losing it, and a single-instance lock lets a scheduled task relaunch the bridge every ten minutes as a self-heal. The Feedback workflow then records an append-only status event in a `job_feedback` table **and** appends the same row to a Google Sheet, answers the callback so the button stops spinning, and redraws the card with a status line — keeping the buttons, so a mis-press is corrected by pressing again (latest event wins). The user sees the redraw in about a second; the slow Google Sheets write is deliberately sequenced after it.
 
 A follow-ups workflow runs every evening: any job marked *applied* and untouched for seven days gets a "any reply yet?" nudge (💬 Got a reply · ❌ Rejected · 🔕 Nothing yet); a *saved* job gets "still interested?" (✅ Apply · ⏭️ Skip · 🔖 Remind me later). Each nudge is itself recorded, so the clock restarts and nothing nags daily. A weekly stats workflow (Sunday) reports the scoring funnel, week-over-week deltas, per-source hit rates, the best delivered jobs, near misses (scored 40+ but not sent) so the gate stays falsifiable — and now the pipeline the buttons produce: applied, saved, replies, rejections, and how many applications are still waiting on an answer.
+
+## Search from Telegram
+
+Typing a request into the same chat — "remote customer support no experience" — runs an on-demand search across the same sources plus Himalayas. It is deliberately *not* graded against the CV: it answers whatever was asked. A small model (`openai/gpt-oss-20b`, rate limits separate from the digest's) turns the request into search terms, a level, and request-specific feeds (a WWR category, a Jobicy industry, Freelancer and Himalayas queries). Postings from the last 30 days are matched on those terms, and the newest 40 go to the model in batches of 10 for a verdict on the kind of work, remoteness, experience and **where they hire from**: worldwide, Israel-listed/EMEA, APAC or unstated are kept and labeled (🌍 / 🇮🇱 / 🌏 / ❔, plus 🕐 for required US/EU hours); anything country- or region-restricted is dropped. The model sees the opening of each posting plus the sentences that mention location or hours wherever they sit, since region rules usually live at the end of a post.
+
+Results come back as one numbered list, ten per message. `more` pages through it; `save 3` writes the job into the same archive, status table and sheet as the digest's Save button, so follow-up nudges and the weekly pipeline pick it up with no extra code. The search workflow is generated by `search/build_workflow.py`, which copies the digest's live fetch nodes instead of duplicating them by hand, and every Code node in it is unit-tested offline against stubbed n8n globals. The first live run caught two restricted jobs labeled worldwide: the copied normalizers drop each source's location field, so the model never saw "Seattle, Washington". A join step now restores it by URL.
 
 ## Resilience
 
@@ -63,12 +73,13 @@ Job postings are untrusted external text passed to an LLM. The scoring prompt ex
 
 | File | What |
 |---|---|
-| `job-hunt-agent.workflow.json` | Main pipeline (53 nodes) |
+| `job-hunt-agent.workflow.json` | Main pipeline (69 nodes) |
 | `job-hunt-agent.feedback.workflow.json` | Button-press handler (webhook → table + sheet → redraw card) |
 | `job-hunt-agent.error-alert.workflow.json` | Error-trigger workflow with hourly throttle |
 | `job-hunt-agent.follow-ups.workflow.json` | Daily 18:00 nudges for applications that went quiet |
 | `job-hunt-agent.weekly-stats.workflow.json` | Sunday funnel / hit-rate report, now including the button-derived pipeline |
-| `scripts/telegram-feedback-bridge.py` | Telegram → local n8n long-polling bridge |
+| `scripts/telegram-feedback-bridge.py` | Telegram → local n8n long-polling bridge (button presses → Feedback, text messages → Search) |
+| `search/` | On-demand search: `build_workflow.py` (assembles + deploys the workflow), Code-node sources, prompts, offline tests |
 | `scripts/sanitize-exports.py` | Regenerates the exports above from a live instance, whitelist-sanitized and secret-scanned |
 
 The exports contain no secrets: credentials are referenced by name only, and the chat id, sheet id and data-table ids are placeholders.
@@ -82,3 +93,4 @@ The exports contain no secrets: credentials are referenced by name only, and the
 5. Optional apply-assist: set `CV_READY = true` in `Apply Prep` and point `Read CV` at a PDF inside n8n's allowed file directory.
 6. In the main workflow's settings, select the error workflow; set the workflow time zone to yours.
 7. For the buttons: put the bot token in a file the bridge can read, run `scripts/telegram-feedback-bridge.py` under a scheduled task, and activate the Feedback workflow.
+8. For search: list your workflow and data-table ids in a git-ignored `sanitize.config.json` (the format is in `scripts/sanitize-exports.py`), run `python3 -I search/build_workflow.py --deploy` (it reads the live main and Feedback workflows), then activate "Job Hunt Agent — Search".
